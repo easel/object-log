@@ -400,6 +400,83 @@ async fn manifest_cas_conflict_prevents_visibility() {
     assert!(read.records.is_empty());
 }
 
+/// Writes to partition 0 must not appear when reading partition 1 of the same topic.
+#[tokio::test]
+async fn partition_isolation_within_same_topic() {
+    for case in conformance_backends() {
+        let backend = test_backend(case.store);
+        let p0 = TopicPartition::new(
+            TopicName::new("isolated").expect("valid"),
+            PartitionId(0),
+        );
+        let p1 = TopicPartition::new(
+            TopicName::new("isolated").expect("valid"),
+            PartitionId(1),
+        );
+
+        backend
+            .append(AppendBatch::new(p0.clone(), records(&[b"p0-a", b"p0-b"])))
+            .await
+            .expect("append p0");
+
+        // p1 should be empty.
+        let read = backend
+            .read(ReadRequest {
+                topic_partition: p1,
+                start_offset: 0,
+                max_records: 10,
+            })
+            .await
+            .expect("read p1");
+        assert!(
+            read.records.is_empty(),
+            "partition 1 must not see partition 0 writes"
+        );
+        assert_eq!(read.high_watermark, Some(0));
+    }
+}
+
+/// Multi-segment read: 6 records across 3 segments (2 records per segment)
+/// must all be returned in offset order when read from offset 0.
+#[tokio::test]
+async fn multi_segment_read_spans_all_segments() {
+    for case in conformance_backends() {
+        let backend = test_backend(case.store);
+        let tp = topic_partition("multi-seg");
+
+        // Three appends → three segments (min_records_per_segment=2).
+        backend
+            .append(AppendBatch::new(tp.clone(), records(&[b"a", b"b"])))
+            .await
+            .expect("seg 0");
+        backend
+            .append(AppendBatch::new(tp.clone(), records(&[b"c", b"d"])))
+            .await
+            .expect("seg 1");
+        backend
+            .append(AppendBatch::new(tp.clone(), records(&[b"e", b"f"])))
+            .await
+            .expect("seg 2");
+
+        let read = backend
+            .read(ReadRequest {
+                topic_partition: tp,
+                start_offset: 0,
+                max_records: 20,
+            })
+            .await
+            .expect("read all");
+
+        assert_eq!(read.records.len(), 6, "all 6 records across 3 segments");
+        assert_eq!(read.high_watermark, Some(6));
+        let values: Vec<&[u8]> = read.records.iter().map(|r| r.value.as_ref()).collect();
+        assert_eq!(values, vec![b"a", b"b", b"c", b"d", b"e", b"f"]);
+        for (i, rec) in read.records.iter().enumerate() {
+            assert_eq!(rec.offset, i as u64, "offset must be sequential");
+        }
+    }
+}
+
 #[test]
 fn invalid_names_and_keys_are_rejected() {
     assert!(matches!(
