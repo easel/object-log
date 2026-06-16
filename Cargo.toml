@@ -2,6 +2,21 @@
 name = "object-log"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "An embeddable append-only log core with a pluggable object-storage backend (segments, content addressing, conditional writes)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/easel/object-log"
+homepage = "https://github.com/easel/object-log"
+documentation = "https://docs.rs/object-log"
+readme = "README.md"
+keywords = ["log", "object-storage", "append-only", "streaming", "wal"]
+categories = ["database-implementations", "asynchronous", "data-structures"]
+# Ship only crate sources + docs/licenses; drop the HELIX/ddx/agent tooling
+# trees and design docs that otherwise bloat the package to ~650 files.
+exclude = [
+    "/.ddx", "/.claude", "/.agents", "/.github",
+    "/docs", "/workflows", "/tests", "/Cargo.lock", "/.gitignore",
+]
 
 [dependencies]
 async-trait = "0.1"

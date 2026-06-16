@@ -405,14 +405,8 @@ async fn manifest_cas_conflict_prevents_visibility() {
 async fn partition_isolation_within_same_topic() {
     for case in conformance_backends() {
         let backend = test_backend(case.store);
-        let p0 = TopicPartition::new(
-            TopicName::new("isolated").expect("valid"),
-            PartitionId(0),
-        );
-        let p1 = TopicPartition::new(
-            TopicName::new("isolated").expect("valid"),
-            PartitionId(1),
-        );
+        let p0 = TopicPartition::new(TopicName::new("isolated").expect("valid"), PartitionId(0));
+        let p1 = TopicPartition::new(TopicName::new("isolated").expect("valid"), PartitionId(1));
 
         backend
             .append(AppendBatch::new(p0.clone(), records(&[b"p0-a", b"p0-b"])))
