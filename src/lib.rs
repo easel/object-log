@@ -5,6 +5,7 @@ mod model;
 mod object_backend;
 mod segment;
 mod store;
+mod util;
 
 pub use error::ObjectLogError;
 pub use model::{

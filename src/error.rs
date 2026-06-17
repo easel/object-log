@@ -11,8 +11,6 @@ pub enum ObjectLogError {
     InvalidBatch,
     #[error("producer sequence conflicts with committed batch")]
     SequenceConflict,
-    #[error("backend does not support idempotent producer metadata")]
-    UnsupportedIdempotence,
     #[error("writer is fenced by a newer epoch")]
     Fenced,
     #[error("manifest or object compare-and-set conflict")]

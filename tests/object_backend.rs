@@ -19,10 +19,8 @@ fn topic_partition(name: &str) -> TopicPartition {
 }
 
 fn test_backend(store: Arc<dyn ObjectStore>) -> ObjectLogBackend {
-    ObjectLogBackend::new(store).with_config(ObjectLogBackendConfig {
-        min_records_per_segment: 2,
-        allow_tiny_segments_for_tests: true,
-    })
+    // Default config allows single-record segments (min_records_per_segment = 1).
+    ObjectLogBackend::new(store)
 }
 
 fn conformance_backends() -> Vec<BackendCase> {
@@ -327,8 +325,14 @@ async fn corrupt_segment_is_rejected_on_read() {
 }
 
 #[tokio::test]
-async fn production_config_rejects_tiny_segments() {
-    let backend = ObjectLogBackend::new(Arc::new(MemoryObjectStore::default()));
+async fn min_records_per_segment_rejects_tiny_segments() {
+    // Opt-in coalescing: configure a floor of 2 records and a single-record
+    // append is rejected. (The default floor is 1, which accepts singletons.)
+    let backend = ObjectLogBackend::new(Arc::new(MemoryObjectStore::default())).with_config(
+        ObjectLogBackendConfig {
+            min_records_per_segment: 2,
+        },
+    );
     let err = backend
         .append(AppendBatch::new(topic_partition("tiny"), records(&[b"a"])))
         .await

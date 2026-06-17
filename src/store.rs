@@ -1,11 +1,16 @@
 use crate::ObjectLogError;
+use crate::util::sha256_hex;
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Suffix appended to in-flight temp files written by [`LocalObjectStore`].
+/// Keys ending in this marker are not representable as durable objects.
+const TMP_SUFFIX: &str = ".olog-tmp";
 
 /// Safe object key used by object-log storage adapters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -167,7 +172,7 @@ impl LocalObjectStore {
             Ok(value) => {
                 let value = Bytes::from(value);
                 Ok(Some(StoredObject {
-                    version: ObjectVersion(hash_hex(&value)),
+                    version: ObjectVersion(sha256_hex(&value)),
                     value,
                 }))
             }
@@ -180,7 +185,11 @@ impl LocalObjectStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = path.with_extension("tmp");
+        // Append (not replace-extension) so the temp name is unique per key and
+        // never collides with a sibling key, e.g. `a.olseg` -> `a.olseg.olog-tmp`.
+        let mut tmp = OsString::from(path.as_os_str());
+        tmp.push(TMP_SUFFIX);
+        let tmp = PathBuf::from(tmp);
         tokio::fs::write(&tmp, value).await?;
         tokio::fs::rename(&tmp, path).await?;
         Ok(())
@@ -222,7 +231,7 @@ impl ObjectStore for LocalObjectStore {
         }
         Self::atomic_write(&self.path_for(key), value.clone()).await?;
         Ok(StoredObject {
-            version: ObjectVersion(hash_hex(&value)),
+            version: ObjectVersion(sha256_hex(&value)),
             value,
         })
     }
@@ -272,20 +281,11 @@ fn collect_files(root: &Path, path: &Path, out: &mut Vec<String>) -> Result<(), 
         let path = entry.path();
         if path.is_dir() {
             collect_files(root, &path, out)?;
-        } else if path.extension().is_none_or(|ext| ext != "tmp")
+        } else if !path.to_string_lossy().ends_with(TMP_SUFFIX)
             && let Ok(relative) = path.strip_prefix(root)
         {
             out.push(relative.to_string_lossy().replace('\\', "/"));
         }
     }
     Ok(())
-}
-
-fn hash_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }

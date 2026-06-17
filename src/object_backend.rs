@@ -1,5 +1,6 @@
 use crate::model::LogBackend;
 use crate::segment::{Segment, decode_segment, encode_segment};
+use crate::util::sha256_hex;
 use crate::{
     AckMode, AppendBatch, AppendResult, AppendedRecord, ObjectKey, ObjectLogError, ObjectStore,
     ObjectVersion, ProducerState, ReadBatch, ReadRequest, TimestampPolicy, TopicPartition,
@@ -24,14 +25,12 @@ pub trait EpochGuard: Send + Sync {
 #[derive(Clone)]
 pub struct ObjectLogBackendConfig {
     pub min_records_per_segment: usize,
-    pub allow_tiny_segments_for_tests: bool,
 }
 
 impl Default for ObjectLogBackendConfig {
     fn default() -> Self {
         Self {
-            min_records_per_segment: 2,
-            allow_tiny_segments_for_tests: false,
+            min_records_per_segment: 1,
         }
     }
 }
@@ -79,9 +78,7 @@ impl ObjectLogBackend {
         if batch.records.is_empty() {
             return Err(ObjectLogError::InvalidBatch);
         }
-        if !self.config.allow_tiny_segments_for_tests
-            && batch.records.len() < self.config.min_records_per_segment
-        {
+        if batch.records.len() < self.config.min_records_per_segment {
             return Err(ObjectLogError::InvalidBatch);
         }
         Ok(())
@@ -144,7 +141,7 @@ impl LogBackend for ObjectLogBackend {
             records,
         };
         let encoded = encode_segment(&segment)?;
-        let checksum = checksum_hex(&encoded);
+        let checksum = sha256_hex(&encoded);
         let segment_key = segment_key(&batch.topic_partition, base_offset)?;
         self.store
             .put_if_absent(&segment_key, encoded.clone())
@@ -207,7 +204,7 @@ impl LogBackend for ObjectLogBackend {
                 .get(&key)
                 .await?
                 .ok_or_else(|| ObjectLogError::MissingObject(entry.segment_key.clone()))?;
-            if checksum_hex(&object.value) != entry.checksum {
+            if sha256_hex(&object.value) != entry.checksum {
                 return Err(ObjectLogError::CorruptSegment(
                     "manifest checksum mismatch".to_string(),
                 ));
@@ -315,14 +312,4 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
-}
-
-fn checksum_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
