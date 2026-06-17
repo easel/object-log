@@ -55,7 +55,8 @@ trait for your client and hand it to `ObjectLogBackend`.
 
 ## Status
 
-`0.1.x` — pre-1.0; the API may evolve. Requires Rust 1.85+ (edition 2024).
+`0.1.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024,
+let-chains).
 
 ## License
 

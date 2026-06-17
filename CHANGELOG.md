@@ -17,6 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - `ObjectLogBackendConfig::min_records_per_segment` now defaults to `1`, so
   single-record appends succeed by default.
+- Declared MSRV corrected to Rust 1.88 (the code uses stable let-chains); the
+  previously declared 1.85 never compiled. Enforced by a CI job.
 
 ### Removed
 - The test-only `allow_tiny_segments_for_tests` config flag (no longer needed).

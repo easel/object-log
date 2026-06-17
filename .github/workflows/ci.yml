@@ -41,8 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install MSRV toolchain (1.85)
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install MSRV toolchain (1.88)
+        uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Build on MSRV
         run: cargo build --all-targets
