@@ -28,13 +28,27 @@ object-log = "0.1"
 ```
 
 ```rust
-use object_log::{ObjectLogBackend, ObjectLogBackendConfig, MemoryObjectStore};
+use object_log::{
+    AppendBatch, AppendRecord, LogBackend, MemoryObjectStore, ObjectLogBackend, PartitionId,
+    ReadRequest, TopicName, TopicPartition,
+};
 use std::sync::Arc;
 
-let store = Arc::new(MemoryObjectStore::new());
-let backend = ObjectLogBackend::new(store, ObjectLogBackendConfig::default());
-// append/read via the LogBackend API …
+let store = Arc::new(MemoryObjectStore::default());
+let backend = ObjectLogBackend::new(store);
+
+let tp = TopicPartition::new(TopicName::new("events")?, PartitionId(0));
+let batch = AppendBatch::new(tp.clone(), vec![AppendRecord::new("hello")]);
+let appended = backend.append(batch).await?;
+assert_eq!(appended.base_offset, Some(0));
+
+let read = backend
+    .read(ReadRequest { topic_partition: tp, start_offset: 0, max_records: 10 })
+    .await?;
+assert_eq!(read.records.len(), 1);
 ```
+
+(A runnable version of this is the crate-level doctest — see [docs.rs](https://docs.rs/object-log).)
 
 To target a different store (e.g. S3/Garage/MinIO), implement the `ObjectStore`
 trait for your client and hand it to `ObjectLogBackend`.

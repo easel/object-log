@@ -28,3 +28,6 @@
 .ddx/plugins/
 .claude/
 .agents/
+
+# Vendored ddx/HELIX library (installed by the ddx plugin; not part of the crate)
+/workflows/
