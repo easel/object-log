@@ -251,6 +251,7 @@ fn read_i64(buf: &mut &[u8]) -> Result<i64, ObjectLogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn tp() -> TopicPartition {
         TopicPartition::new(TopicName::new("events").unwrap(), PartitionId(0))
@@ -295,5 +296,69 @@ mod tests {
             decode_segment(&encoded),
             Err(ObjectLogError::CorruptSegment(_))
         ));
+    }
+
+    proptest! {
+        // Any well-formed segment encodes and decodes back to itself.
+        #[test]
+        fn round_trips_arbitrary_segments(
+            base in 0u64..1_000_000,
+            epoch in any::<u64>(),
+            recs in prop::collection::vec(
+                (
+                    proptest::option::of(prop::collection::vec(any::<u8>(), 0..8)),
+                    prop::collection::vec(any::<u8>(), 0..16),
+                    any::<i64>(),
+                    prop::collection::vec(
+                        ("[a-z]{0,4}", prop::collection::vec(any::<u8>(), 0..8)),
+                        0..3,
+                    ),
+                ),
+                1..16,
+            ),
+        ) {
+            let records: Vec<AppendedRecord> = recs
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, value, ts, headers))| AppendedRecord {
+                    offset: base + i as u64,
+                    key: key.map(Bytes::from),
+                    value: Bytes::from(value),
+                    headers: headers
+                        .into_iter()
+                        .map(|(name, value)| RecordHeader { name, value: Bytes::from(value) })
+                        .collect(),
+                    timestamp_ms: ts,
+                })
+                .collect();
+            let segment = Segment { topic_partition: tp(), base_offset: base, epoch, records };
+            let encoded = encode_segment(&segment).unwrap();
+            let decoded = decode_segment(&encoded).unwrap();
+            prop_assert_eq!(decoded, segment);
+        }
+
+        // The decoder must never panic on arbitrary bytes — only Ok or Err.
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = decode_segment(&bytes);
+        }
+
+        // Truncating a valid segment at any point must not panic.
+        #[test]
+        fn decode_never_panics_on_truncation(n in 1usize..16, cut in any::<prop::sample::Index>()) {
+            let records: Vec<AppendedRecord> = (0..n)
+                .map(|i| AppendedRecord {
+                    offset: i as u64,
+                    key: None,
+                    value: Bytes::from_static(b"x"),
+                    headers: vec![],
+                    timestamp_ms: 0,
+                })
+                .collect();
+            let segment = Segment { topic_partition: tp(), base_offset: 0, epoch: 0, records };
+            let encoded = encode_segment(&segment).unwrap();
+            let at = cut.index(encoded.len());
+            let _ = decode_segment(&encoded[..at]);
+        }
     }
 }

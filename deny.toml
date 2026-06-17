@@ -1,0 +1,32 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# Fail on any security advisory or unmaintained/yanked crate.
+
+[licenses]
+version = 2
+# object-log is dual MIT OR Apache-2.0; only permissive licenses are allowed in
+# the dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Allow multiple versions (transitive duplicates are common); flag nothing here
+# by default. Tighten if dependency bloat becomes a concern.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
