@@ -9,6 +9,12 @@ ddx:
 
 # ADR-001: Kafka-Compatible Core with Object-Storage Backend
 
+> **Status: Superseded by [ADR-002](ADR-002-object-storage-log-engine-and-sequencer-seam.md) (2026-06-17).**
+> The one-object-per-append backend and manifest compare-and-set commit boundary
+> described here are replaced by a buffered, multiplexing engine with a pluggable
+> `Sequencer` seam. The Kafka-compatible record/ack/idempotency vocabulary below
+> is retained.
+
 ## Context
 
 object-log started as an extraction target for shared S3 WAL mechanics from pqueue and Niflheim. The interface question changes the product shape: the useful abstraction is not "a WAL file writer" but a partitioned commit log whose core semantics are compatible with Kafka's producer and partition-log model.
