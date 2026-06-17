@@ -78,7 +78,20 @@ pub trait Sequencer: Send + Sync {
     /// offset namespace and the offset→location index).
     fn lookup(&self, partition: &PartitionKey, fetch_offset: i64)
         -> Result<Vec<IndexEntry>, ObjectLogError>;
+
+    /// Cheap, index-only offset bounds (no object reads).
     fn high_watermark(&self, partition: &PartitionKey) -> Result<i64, ObjectLogError>;
+    fn log_start_offset(&self, partition: &PartitionKey) -> Result<i64, ObjectLogError>;
+
+    /// Retention MECHANISM (not policy): drop index entries below `offset` and
+    /// return the object ids that now have NO live references from ANY partition
+    /// — multiplexed objects are shared, so an object is reclaimable only when its
+    /// last referencing entry across all partitions is truncated. The engine
+    /// deletes the returned ids via `BlobStore::delete`. The *policy* (when
+    /// truncation is safe) lives in the consumer. Serves Kafka retention /
+    /// DeleteRecords (fjord) and watermark-driven WAL retirement (niflheim) alike.
+    fn truncate_before(&self, partition: &PartitionKey, offset: i64)
+        -> Result<Vec<ObjectId>, ObjectLogError>;
 }
 ```
 
@@ -86,7 +99,7 @@ pub trait Sequencer: Send + Sync {
 
 **5. Sync seam, async engine.** The `Sequencer` is sync because a linearization point is a critical section, not async I/O — and fjord's sequencer does blocking Postgres I/O. The engine owns the flush worker (a dedicated thread / blocking task, per fjord's proven `Flusher`) and resolves async produce futures via waker. No `async_trait`/`spawn_blocking` tax on the lin-point.
 
-**6. Fetch.** `engine.fetch(partition, offset, max_bytes)` calls `sequencer.lookup` → reads the covering objects via `BlobStore` → slices `byte_start..byte_len`. Pure storage IO; the index is the sequencer's.
+**6. Fetch.** `engine.fetch(partition, offset, max_bytes)` calls `sequencer.lookup` → reads the covering objects via `BlobStore` → slices `byte_start..byte_len`. Pure storage IO; the index is the sequencer's. The engine also exposes `engine.truncate_before(partition, offset)` (calls the sequencer, then deletes the returned dead object ids) and an optional **streaming read** (`fetch_stream`, visitor/`Stream`) so a consumer can replay a wide offset window without materializing it (niflheim's bounded-RAM replay; optional for fjord, whose fetch responses are already size-bounded).
 
 **7. Offset stamping stays in heimq.** object-log stores and returns **opaque** payload bytes plus the assigned `base_offset`. Writing that offset into a Kafka v2 record batch is heimq's job (it owns the format). fjord must stop poking bytes `[0..8]`.
 
@@ -97,6 +110,12 @@ pub trait Sequencer: Send + Sync {
 - **In-order, un-split per-partition presentation.** For any single `PartitionKey`, the engine presents batches to `commit` in arrival (send) order, and never splits one partition's batches across two concurrent in-flight `commit` calls. (Else idempotent sequence-gap detection and epoch fencing misfire — a producer's sequence space is per-partition.) The engine enforces this **without reading `Meta`**, using only the engine-visible `PartitionKey`: satisfied by a single flush worker (FIFO buffer, no sorting), or — if concurrent flush workers are ever added — by sharding concurrency on **`PartitionKey`** while preserving per-key arrival order. Never shard on producer identity (it lives inside the opaque `Meta`, which the engine must not read) and never partition-sort the buffer. The engine **moves** each `Meta` out of its FIFO buffer into `commit` (so `Meta: Send + Sync` suffices — no `Clone` bound).
 - **Atomic commit.** `commit` is all-or-nothing across every batch in the object; on `Err` the engine acks nothing (no co-multiplexed survivor is acked).
 - **Unique object id, fresh on retry, durable-before-index.** Each flush uses a unique object key; a retry uses a *fresh* key so a crashed PUT is never aliased; a `lookup` entry implies its byte range is durably readable.
+
+## Scope boundary & second consumer (niflheim)
+
+object-log is the **durable object-storage log tier**: durability == the object PUT. It deliberately has **no local hot tier and no sub-PUT fsync latency tiers**. A consumer needing sub-millisecond local durability (niflheim's `FireAndForget`/`Tracked` hot-disk path) fronts object-log with its own buffer — that tier is explicitly out of object-log's scope. This is why the durability levels (`Buffered`/`Durable`/`Sequenced`) describe the object PUT + sequence, not a disk fsync.
+
+niflheim's WAL was evaluated as a second consumer to test genericity (object-log's own vision names it). Result: **its cold tier maps ~1:1 onto this design** — immutable, checksummed, offset-indexed segments coalesced onto an object store — which validates that the design is genuinely generic and not fjord-shaped. Three of our decisions are confirmed by the exercise: payloads are **opaque** (niflheim serializes its tenant/offset/event-id structure into the payload; object-log never learns those fields), epoch fencing lives **behind the Sequencer** (not in core), and record framing is **not** a core concern. The dual-consumer requirement is exactly what motivated the generic primitives above — `truncate_before` (Kafka retention *and* WAL retirement), index-only offset bounds, and the optional streaming read — none of which leak Kafka or WAL concepts. Two niflheim concerns are correctly **excluded**: its hot/fsync tier (above) and its record codec (a niflheim-side concern over opaque payloads).
 
 ## Alternatives
 
