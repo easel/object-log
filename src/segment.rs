@@ -1,3 +1,18 @@
+//! On-disk segment format (little-endian, version 1).
+//!
+//! ```text
+//! header:  MAGIC "OLOG" (4) | version u16 | topic_len u16 | topic bytes
+//!          | partition u32 | base_offset u64 | epoch u64 | record_count u32
+//! record:  offset_delta u32 | timestamp_ms i64 | key_len i32 (-1 = none)
+//!          | value_len u32 | header_count u16 | [key] | value
+//!          | header*( name_len u16 | value_len u32 | name | value )
+//! trailer: SHA-256 (32) over all preceding bytes
+//! ```
+//!
+//! Records are offset-contiguous from `base_offset`. Decoding verifies the
+//! trailer checksum, the magic/version, contiguity, and that no trailing bytes
+//! remain before the checksum.
+
 use crate::{AppendedRecord, ObjectLogError, PartitionId, RecordHeader, TopicName, TopicPartition};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};

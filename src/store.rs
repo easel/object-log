@@ -17,6 +17,10 @@ const TMP_SUFFIX: &str = ".olog-tmp";
 pub struct ObjectKey(String);
 
 impl ObjectKey {
+    /// Validate and wrap an object key.
+    ///
+    /// Rejects empty keys and keys containing `\0` or a `..` path component
+    /// (returning [`ObjectLogError::InvalidObjectKey`]).
     pub fn new(value: impl Into<String>) -> Result<Self, ObjectLogError> {
         let value = value.into();
         if value.is_empty() || value.contains('\0') || value.split('/').any(|part| part == "..") {
@@ -25,51 +29,88 @@ impl ObjectKey {
         Ok(Self(value))
     }
 
+    /// Borrow the validated key as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
+/// Opaque version token for an object, used as the precondition for
+/// [`ObjectStore::compare_and_set`].
+///
+/// The token's meaning is store-defined: [`MemoryObjectStore`] uses a monotonic
+/// write counter, while [`LocalObjectStore`] uses the SHA-256 content hash. Two
+/// writes of identical bytes therefore share a version on the local store but
+/// not in memory — treat versions as opaque and never compare them across
+/// stores.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectVersion(pub String);
 
+/// An object's bytes together with its current [`ObjectVersion`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredObject {
+    /// The stored bytes.
     pub value: Bytes,
+    /// The version token for these bytes.
     pub version: ObjectVersion,
 }
 
+/// Outcome of [`ObjectStore::put_if_absent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {
+    /// The object did not exist and was written.
     Created,
+    /// The object already existed with byte-identical content (idempotent no-op).
     AlreadyExistsSame,
 }
 
+/// Conditional-write capabilities advertised by an [`ObjectStore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreCapabilities {
+    /// Whether [`ObjectStore::compare_and_set`] is supported.
     pub compare_and_set: bool,
+    /// Whether [`ObjectStore::put_if_absent`] is supported.
     pub put_if_absent: bool,
 }
 
+/// A minimal async object store: the storage *port* the log is built on.
+///
+/// Implement this for your own backend (e.g. an S3 client) to durably store the
+/// log elsewhere. The log relies on the conditional writes
+/// ([`put_if_absent`](ObjectStore::put_if_absent) /
+/// [`compare_and_set`](ObjectStore::compare_and_set)) being atomic per key.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Fetch an object and its version, or `None` if absent.
     async fn get(&self, key: &ObjectKey) -> Result<Option<StoredObject>, ObjectLogError>;
+    /// Write `value` only if the key is absent. Re-writing identical bytes is an
+    /// idempotent [`PutOutcome::AlreadyExistsSame`]; different bytes conflict
+    /// with [`ObjectLogError::ObjectConflict`].
     async fn put_if_absent(
         &self,
         key: &ObjectKey,
         value: Bytes,
     ) -> Result<PutOutcome, ObjectLogError>;
+    /// Atomically replace the object iff its current version equals `expected`
+    /// (`None` meaning "must not exist"), returning the newly stored object. A
+    /// version mismatch yields [`ObjectLogError::Conflict`].
     async fn compare_and_set(
         &self,
         key: &ObjectKey,
         expected: Option<ObjectVersion>,
         value: Bytes,
     ) -> Result<StoredObject, ObjectLogError>;
+    /// List keys beginning with `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectKey>, ObjectLogError>;
+    /// Delete an object; deleting a missing key is a no-op success.
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectLogError>;
+    /// Report which conditional writes this store supports.
     fn capabilities(&self) -> StoreCapabilities;
 }
 
+/// In-process [`ObjectStore`] backed by a `BTreeMap`. For tests and development;
+/// state is not shared across processes and is lost on drop. Versions are a
+/// monotonic per-key write counter.
 #[derive(Clone, Default)]
 pub struct MemoryObjectStore {
     objects: Arc<Mutex<BTreeMap<String, (Bytes, u64)>>>,
@@ -148,6 +189,13 @@ impl ObjectStore for MemoryObjectStore {
     }
 }
 
+/// Filesystem-backed [`ObjectStore`] rooted at a directory.
+///
+/// Objects are written atomically (temp file + rename) and versioned by SHA-256
+/// content hash. Conditional writes are serialized by an in-process lock, so
+/// atomicity holds **only within a single process** — do not point two processes
+/// at the same root and expect compare-and-set to be safe. Suitable for
+/// single-node use and tests against a real filesystem.
 #[derive(Clone)]
 pub struct LocalObjectStore {
     root: Arc<PathBuf>,
@@ -155,6 +203,7 @@ pub struct LocalObjectStore {
 }
 
 impl LocalObjectStore {
+    /// Create a store rooted at `root` (created lazily on first write).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Arc::new(root.into()),

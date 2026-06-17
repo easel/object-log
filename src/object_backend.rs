@@ -12,9 +12,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// External epoch validation hook. Callers own the control plane.
+/// External epoch validation hook so callers can fence stale writers.
+///
+/// The control plane lives outside this crate; supply an implementation via
+/// [`ObjectLogBackend::with_epoch_guard`] and set [`AppendBatch::expected_epoch`]
+/// to have each append validated before it becomes visible.
 #[async_trait]
 pub trait EpochGuard: Send + Sync {
+    /// Return `Ok(())` if `expected_epoch` is still current for the partition,
+    /// or [`ObjectLogError::Fenced`] if a newer epoch has taken over.
     async fn check(
         &self,
         topic_partition: &TopicPartition,
@@ -22,8 +28,12 @@ pub trait EpochGuard: Send + Sync {
     ) -> Result<(), ObjectLogError>;
 }
 
+/// Tuning for [`ObjectLogBackend`].
 #[derive(Clone)]
 pub struct ObjectLogBackendConfig {
+    /// Minimum records an append must carry, rejecting smaller batches with
+    /// [`ObjectLogError::InvalidBatch`]. Defaults to `1` (accept singletons);
+    /// raise it to force producers to coalesce into larger segments.
     pub min_records_per_segment: usize,
 }
 
@@ -35,6 +45,11 @@ impl Default for ObjectLogBackendConfig {
     }
 }
 
+/// A [`LogBackend`] that stores the log as immutable, checksummed segments plus a
+/// per-partition manifest in any [`ObjectStore`].
+///
+/// See the [crate-level docs](crate#concurrency-model) for the optimistic
+/// compare-and-set commit protocol and retry expectations.
 pub struct ObjectLogBackend {
     store: Arc<dyn ObjectStore>,
     epoch_guard: Option<Arc<dyn EpochGuard>>,
@@ -42,6 +57,7 @@ pub struct ObjectLogBackend {
 }
 
 impl ObjectLogBackend {
+    /// Create a backend over `store` with default configuration.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
             store,
@@ -50,11 +66,13 @@ impl ObjectLogBackend {
         }
     }
 
+    /// Override the configuration (builder style).
     pub fn with_config(mut self, config: ObjectLogBackendConfig) -> Self {
         self.config = config;
         self
     }
 
+    /// Attach an [`EpochGuard`] to fence stale writers (builder style).
     pub fn with_epoch_guard(mut self, epoch_guard: Arc<dyn EpochGuard>) -> Self {
         self.epoch_guard = Some(epoch_guard);
         self
