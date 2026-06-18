@@ -1,79 +1,42 @@
-//! An embeddable, append-only log core with a pluggable object-storage backend.
+//! A buffered, multiplexing append log over pluggable object storage.
 //!
-//! `object-log` implements Kafka-style log semantics — topics, partitions, dense
-//! monotonic offsets, idempotent producers, and batched append/read — on top of a
-//! small [`ObjectStore`] trait, so the durable bytes can live in memory, on a
-//! local filesystem, or (via your own adapter) in S3-compatible object storage.
+//! object-log stores an ordered, offset-addressed log as immutable objects in any
+//! [`BlobStore`] (memory, local filesystem, or — behind a feature — S3). It deals
+//! only in **opaque payload bytes**: it knows nothing about record formats, Kafka,
+//! or brokers. Two seams keep it generic:
 //!
-//! # Architecture
+//! - [`BlobStore`] — the storage *port*: durable-on-return `put`, `get`,
+//!   `get_range`, `list`, `delete`. Adapters [`MemoryBlobStore`] and
+//!   [`LocalBlobStore`] ship in-crate.
+//! - [`Sequencer`] — the *sequencing seam*: assigns offsets to durably-stored
+//!   batches and owns the offset→location index. The engine (added on top of these
+//!   types) buffers and group-commits many batches into one object, PUTs it
+//!   durably, then calls the sequencer — so PUT count is decoupled from produce
+//!   count. A consumer plugs its own sequencer (e.g. a Kafka coordinator); the
+//!   engine forwards each sequencer's [`Sequencer::Meta`] uninterpreted.
 //!
-//! - [`ObjectStore`] is the storage *port*: a minimal async key/value trait with
-//!   conditional writes ([`ObjectStore::put_if_absent`],
-//!   [`ObjectStore::compare_and_set`]). Two adapters ship in-crate:
-//!   [`MemoryObjectStore`] (tests/dev) and [`LocalObjectStore`] (filesystem).
-//! - [`LogBackend`] is the log API: [`LogBackend::append`] / [`LogBackend::read`]
-//!   over [`AppendBatch`] / [`ReadBatch`].
-//! - [`ObjectLogBackend`] implements [`LogBackend`] over any [`ObjectStore`]: it
-//!   writes immutable, content-checksummed *segments* and a per-partition
-//!   manifest, assigning dense offsets via an optimistic compare-and-set on the
-//!   manifest. An optional [`EpochGuard`] fences concurrent writers.
-//!
-//! # Concurrency model
-//!
-//! [`ObjectLogBackend::append`] is *optimistic*: it reads the current manifest,
-//! writes the new segment, then commits the manifest with a
-//! [`ObjectStore::compare_and_set`] guarded by the version it read. If a
-//! concurrent writer committed in between, the commit fails with
-//! [`ObjectLogError::Conflict`] and the caller should retry (re-reading the
-//! manifest). There is no internal retry loop — single-writer-per-partition, or
-//! caller-side retry/serialization, is expected. The losing writer's orphaned
-//! segment is harmless: it is content-addressed and simply unreferenced.
-//!
-//! # Example
+//! # Example — the storage port
 //!
 //! ```
-//! use object_log::{
-//!     AppendBatch, AppendRecord, LogBackend, MemoryObjectStore, ObjectLogBackend,
-//!     PartitionId, ReadRequest, TopicName, TopicPartition,
-//! };
-//! use std::sync::Arc;
+//! use object_log::{BlobStore, MemoryBlobStore};
+//! use bytes::Bytes;
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
-//! let store = Arc::new(MemoryObjectStore::default());
-//! let backend = ObjectLogBackend::new(store);
-//!
-//! let tp = TopicPartition::new(TopicName::new("events").unwrap(), PartitionId(0));
-//! let appended = backend
-//!     .append(AppendBatch::new(tp.clone(), vec![AppendRecord::new("hello")]))
-//!     .await
-//!     .unwrap();
-//! assert_eq!(appended.base_offset, Some(0));
-//!
-//! let read = backend
-//!     .read(ReadRequest { topic_partition: tp, start_offset: 0, max_records: 10 })
-//!     .await
-//!     .unwrap();
-//! assert_eq!(read.records.len(), 1);
-//! assert_eq!(read.records[0].value, "hello");
+//! let store = MemoryBlobStore::new();
+//! store.put("logs/0", Bytes::from_static(b"hello world")).await.unwrap();
+//! assert_eq!(store.get("logs/0").await.unwrap().unwrap(), "hello world");
+//! // Read just a slice — e.g. one batch out of a multiplexed object.
+//! assert_eq!(store.get_range("logs/0", 0..5).await.unwrap().unwrap(), "hello");
 //! # });
 //! ```
 #![deny(missing_docs)]
 
+mod blob;
 mod error;
-mod model;
-mod object_backend;
-mod segment;
-mod store;
-mod util;
+mod sequencer;
 
+pub use blob::{BlobStore, LocalBlobStore, MemoryBlobStore};
 pub use error::ObjectLogError;
-pub use model::{
-    AckMode, AppendBatch, AppendRecord, AppendResult, AppendedRecord, LogBackend, PartitionId,
-    ProducerState, ReadBatch, ReadRequest, RecordHeader, TimestampPolicy, TopicName,
-    TopicPartition,
-};
-pub use object_backend::{EpochGuard, ObjectLogBackend, ObjectLogBackendConfig};
-pub use store::{
-    LocalObjectStore, MemoryObjectStore, ObjectKey, ObjectStore, ObjectVersion, PutOutcome,
-    StoreCapabilities, StoredObject,
+pub use sequencer::{
+    BatchLocation, CommitBatch, CommitOutcome, IndexEntry, PartitionKey, Sequencer,
 };

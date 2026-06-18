@@ -3,7 +3,7 @@ name = "object-log"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "An embeddable append-only log core with a pluggable object-storage backend (segments, content addressing, conditional writes)."
+description = "A buffered, multiplexing append log over pluggable object storage, with a sequencing seam (opaque payloads, durable-on-return writes, group-commit)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/easel/object-log"
 homepage = "https://github.com/easel/object-log"
@@ -23,9 +23,8 @@ async-trait = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 proptest = "1"
