@@ -48,12 +48,16 @@ mod blob;
 mod engine;
 mod error;
 mod manifest_sequencer;
+#[cfg(feature = "s3")]
+mod s3;
 mod sequencer;
 
 pub use blob::{BlobStore, LocalBlobStore, MemoryBlobStore};
 pub use engine::{AppendOutcome, Durability, FetchedBatch, FlushConfig, LogEngine};
 pub use error::ObjectLogError;
 pub use manifest_sequencer::ManifestSequencer;
+#[cfg(feature = "s3")]
+pub use s3::S3BlobStore;
 pub use sequencer::{
     BatchLocation, CommitBatch, CommitOutcome, InMemorySequencer, IndexEntry, PartitionKey,
     Sequencer,
