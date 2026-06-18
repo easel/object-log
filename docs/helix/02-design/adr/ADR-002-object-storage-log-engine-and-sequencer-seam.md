@@ -50,33 +50,51 @@ heimq-broker│ (no edge either way) │
 
 We will **re-found object-log as a generic, buffered, multiplexing, durability-aware object-storage log engine that is generic over a pluggable `Sequencer`.** This supersedes ADR-001's per-append, Kafka-shaped model.
 
-**1. `BlobStore` port — the only storage abstraction.** Async over immutable objects keyed by string. Adapters: `Memory`, `Local`, `S3` (feature-gated). Replaces both the CAS `ObjectStore` and fjord's private `BlobStore`/`S3BlobStore`. No conditional writes needed — object keys are unique per flush.
+**1. `BlobStore` port — the only storage abstraction.** Async over immutable objects keyed by string. Adapters: `Memory` (test/dev — **not** crash-durable), `Local`, `S3` (feature-gated). Replaces both the CAS `ObjectStore` and fjord's private `BlobStore`/`S3BlobStore`. No conditional writes needed — object keys are unique per flush.
 
 ```rust
 trait BlobStore: Send + Sync {
-    /// PUT `value` at `key`. MUST be durable-on-return: when this resolves Ok,
-    /// the bytes survive process/host crash (S3 inherently; the Local adapter
-    /// fsyncs the file AND its parent directory before returning). Callers may
-    /// treat a returned Ok as a durability barrier.
+    /// PUT `value` at `key`. On `Local`/`S3` this is **durable-on-return**: when
+    /// it resolves Ok the bytes survive process/host crash, so a caller may treat
+    /// Ok as a durability barrier. (The `Memory` adapter is test/dev only and is
+    /// NOT crash-durable — do not use it where the durability contract matters.)
+    /// The `Local` adapter MUST persist in EXACTLY this order, or it loses data on
+    /// power loss while returning Ok: write a temp file → `fsync(temp)` → `rename`
+    /// into place → `fsync(parent dir)`. (macOS needs `F_FULLFSYNC` for true
+    /// device durability.) `value` may be ARBITRARILY LARGE: the `S3` adapter
+    /// dispatches multipart upload above a size threshold so a 100 MiB+ object is
+    /// not one whole-buffer PUT — object-log owns multipart internally; callers
+    /// never see it. (An optional `put_streaming(key, reader)` may be added later
+    /// for writers that cannot hold the whole object in RAM; not required for v1.)
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError>;
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError>;
-    /// Read a byte sub-range of an object (S3 Range GET; local pread). Lets a
-    /// consumer pull one batch/chunk out of a large multiplexed object without
-    /// fetching the whole thing. `None` if the key is absent; an out-of-bounds
-    /// range is an error.
+    /// Read a byte sub-range (S3 Range GET; local pread) — pull one batch/chunk
+    /// out of a large multiplexed object without fetching the whole thing.
+    /// `None` if the key is absent; `range.end > len` or `start > end` is an
+    /// error; an empty `n..n` returns `Ok(Some(empty))`. The port does **no
+    /// integrity check**: payloads are opaque, so verifying a slice is the
+    /// consumer's concern over its own per-batch/per-chunk framing (heimq's v2
+    /// batch CRC; niflheim's per-chunk checksum). object-log never
+    /// whole-object-checksums — that would be incompatible with slice reads.
     async fn get_range(&self, key: &str, range: Range<u64>)
         -> Result<Option<Bytes>, ObjectLogError>;
+    /// Keys under `prefix`. Paginates internally (S3 continuation tokens) and
+    /// returns the full set. (At very large key counts the whole-`Vec` result is
+    /// a memory consideration; a streaming/paginated variant can be added if a
+    /// consumer needs it — e.g. niflheim's hundreds-of-thousands-of-segments boot
+    /// scan.)
     async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError>;
     async fn delete(&self, key: &str) -> Result<(), ObjectLogError>;
 }
 ```
 
-The **durable-on-return** contract is what lets a consumer mark a write committed
-once `put` resolves (niflheim's control plane sets `cold_durable` after the PUT;
-fjord's `acks=all`→`Sequenced` depends on it). **`get_range`** serves consumers
-that address sub-object byte ranges (niflheim loads one chunk from a coalesced cold
-segment; the engine's own `fetch` uses it to read only the needed slice rather than
-the whole object). Both are generic — no Kafka or WAL concepts.
+Three generic contract points carry the dual-consumer (fjord + niflheim) load,
+none leaking Kafka or WAL concepts: **durable-on-return `put`** (a consumer marks a
+write committed once `put` resolves — niflheim's `cold_durable`, fjord's
+`acks=all`→`Sequenced`), **large-object/multipart `put`** (100 MiB+ coalesced
+segments and big multiplexed objects don't become a single PUT), and **`get_range`**
+(sub-object byte addressing — niflheim loads one chunk from a coalesced segment; the
+engine's `fetch` reads only the needed slice). `list` paginates internally.
 
 **2. `LogEngine<S: Sequencer>` — buffered group-commit.** Accepts opaque batch payloads with a partition key, a record count, and `S`'s metadata; **group-commits**: many batches across many partitions are multiplexed into **one** object, PUT durably, then handed to the sequencer in one call. Owns the flush policy `FlushConfig { max_bytes, max_batches, linger }`. The engine **authors each batch's `BatchLocation { object_id, byte_start, byte_len }`** (its concern); it never inspects `S`'s metadata.
 
@@ -145,7 +163,7 @@ A full in-object-log **n-tier** (hot + cold + migration) model was formally prop
 
 niflheim's WAL was evaluated as a second consumer to test genericity (object-log's own vision names it). Result: **its cold tier maps ~1:1 onto this design** — immutable, checksummed, offset-indexed segments coalesced onto an object store — which validates that the design is genuinely generic and not fjord-shaped. Three of our decisions are confirmed by the exercise: payloads are **opaque** (niflheim serializes its tenant/offset/event-id structure into the payload; object-log never learns those fields), epoch fencing lives **behind the Sequencer** (not in core), and record framing is **not** a core concern. The dual-consumer requirement is exactly what motivated the generic primitives above — `truncate_before` (Kafka retention *and* WAL retirement), index-only offset bounds, and the optional streaming read — none of which leak Kafka or WAL concepts. Two niflheim concerns are correctly **excluded**: its hot/fsync tier (above) and its record codec (a niflheim-side concern over opaque payloads).
 
-niflheim's **chunk tracking** (`chunk_seq`, offset bounds, `cold_durable`/`backing_store_flushed` state) and **durable-commit** (epoch-leased "publish only after durable") live in its control plane + segment index — *above* the storage port — so they are unaffected by swapping the cold backend to object-log; niflheim keeps them. They depend on object-log only via two `BlobStore` guarantees, both folded into the port above and both generic: **durable-on-return `put`** (so the control plane can mark `cold_durable` once the PUT resolves) and **`get_range`** (so a chunk can be loaded from a coalesced cold object by byte range). niflheim wraps object-log's `BlobStore` in a thin `ObjectStore` adapter for the cold path (`state` is always-cold; `sync_to_cold` = the PUT); object-log is the cold blob backend, niflheim owns everything above it.
+niflheim's **chunk tracking** (`chunk_seq`, offset bounds, `cold_durable`/`backing_store_flushed` state) and **durable-commit** (epoch-leased "publish only after durable") live in its control plane + segment index — *above* the storage port — so they are unaffected by swapping the cold backend to object-log; niflheim keeps them. They depend on object-log only via the generic `BlobStore` guarantees folded into the port above: **durable-on-return `put`** (mark `cold_durable` once the PUT resolves), **large-object/multipart `put`** (100 MiB+ coalesced segments are not a single whole-buffer PUT), and **`get_range`** (load one chunk from a coalesced cold object by byte range), with `list` paginating internally for the boot-recovery scan. Everything else in niflheim's richer cold port is **adapter-local** over those primitives — `FileRef` = a key plus the written length; the SHA-256 sidecar = a second object; `state`/`sync_to_cold`/`stage_to_hot`/`prefetch_hint`/`refresh` = trivial cold-only bookkeeping (verified: no HEAD, no CopyObject in niflheim's cold path). So the thin-adapter claim holds: object-log is the cold blob backend, niflheim owns everything above it.
 
 ## Alternatives
 
