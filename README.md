@@ -1,62 +1,65 @@
 # object-log
 
-An embeddable, append-only log core with a **pluggable object-storage backend**.
+A buffered, multiplexing **append log over pluggable object storage**.
 
-`object-log` implements Kafka-style log semantics — topics, partitions, dense
-monotonic offsets, idempotent producers, batched append/read — on top of a small
-`ObjectStore` trait, so the durable bytes can live in memory, on a local
-filesystem, or (via your own adapter) in S3-compatible object storage. It is the
-storage core extracted from the [fjord](https://github.com/easel/fjord)
-Kafka-compatible broker.
+`object-log` stores an ordered, offset-addressed log as immutable objects in any
+`BlobStore` (memory, local filesystem, or — behind the `s3` feature — S3). It
+deals only in **opaque payload bytes**: it knows nothing about record formats,
+Kafka, or brokers. Many produce calls group-commit into one object, so PUT count
+is decoupled from produce count. It is the storage engine extracted from the
+[fjord](https://github.com/easel/fjord) Kafka-compatible broker.
 
 ## Highlights
 
-- **`ObjectStore` port** — a minimal async trait (`put` / `get` / `list` /
-  `delete` / conditional `compare-and-set`) with `StoreCapabilities`. Ships with
-  `MemoryObjectStore` (tests/dev) and `LocalObjectStore` (real filesystem).
-- **`LogBackend`** — topic/partition append + read with dense offsets,
-  `AppendBatch`/`ReadBatch`, `AckMode`, `TimestampPolicy`, and record headers.
-- **`ObjectLogBackend`** — the object-storage-backed `LogBackend`: segmented,
-  content-addressed objects with an `EpochGuard` for fencing concurrent writers.
-- **Idempotency** — `ProducerState` for de-duplicated, gapless appends.
+- **`BlobStore` port** — a minimal async trait (`put` / `get` / `get_range` /
+  `list` / `delete`) with durable-on-return writes. Ships with `MemoryBlobStore`,
+  `LocalBlobStore`, and `S3BlobStore` (feature `s3`; multipart + range reads).
+- **`LogEngine`** — buffers and group-commits many batches into one object, PUTs
+  it durably, then sequences it; `produce` resolves at a chosen `Durability`
+  (`Buffered` / `Durable` / `Sequenced`), `fetch` reads by offset.
+- **`Sequencer` seam** — a sync trait that assigns offsets and owns the index;
+  ships `InMemorySequencer` and a crash-durable `ManifestSequencer`. Plug your own
+  (e.g. a Kafka coordinator); the engine forwards its `Meta` uninterpreted.
 
 ## Usage
 
 ```toml
 [dependencies]
-object-log = "0.1"
+object-log = "0.2"
 ```
 
 ```rust
 use object_log::{
-    AppendBatch, AppendRecord, LogBackend, MemoryObjectStore, ObjectLogBackend, PartitionId,
-    ReadRequest, TopicName, TopicPartition,
+    Durability, FlushConfig, InMemorySequencer, LogEngine, MemoryBlobStore, PartitionKey,
 };
+use bytes::Bytes;
 use std::sync::Arc;
 
-let store = Arc::new(MemoryObjectStore::default());
-let backend = ObjectLogBackend::new(store);
+let engine = LogEngine::new(
+    Arc::new(MemoryBlobStore::new()),
+    Arc::new(InMemorySequencer::new()),
+    FlushConfig::default(),
+    "log/",
+);
+let p = PartitionKey("events-0".into());
 
-let tp = TopicPartition::new(TopicName::new("events")?, PartitionId(0));
-let batch = AppendBatch::new(tp.clone(), vec![AppendRecord::new("hello")]);
-let appended = backend.append(batch).await?;
-assert_eq!(appended.base_offset, Some(0));
-
-let read = backend
-    .read(ReadRequest { topic_partition: tp, start_offset: 0, max_records: 10 })
+let out = engine
+    .produce(p.clone(), Bytes::from_static(b"hello"), 1, (), Durability::Sequenced)
     .await?;
-assert_eq!(read.records.len(), 1);
+assert_eq!(out.base_offset, Some(0));
+
+let read = engine.fetch(&p, 0, 1 << 20).await?;
+assert_eq!(read[0].payload, "hello");
 ```
 
-(A runnable version of this is the crate-level doctest — see [docs.rs](https://docs.rs/object-log).)
+(A runnable version is the crate-level doctest — see [docs.rs](https://docs.rs/object-log).)
 
-To target a different store (e.g. S3/Garage/MinIO), implement the `ObjectStore`
-trait for your client and hand it to `ObjectLogBackend`.
+To target S3/Garage/MinIO, enable the `s3` feature and use `S3BlobStore`, or
+implement the `BlobStore` trait for your client.
 
 ## Status
 
-`0.1.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024,
-let-chains).
+`0.2.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).
 
 ## License
 
