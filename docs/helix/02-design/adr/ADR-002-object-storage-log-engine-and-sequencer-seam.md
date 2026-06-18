@@ -50,7 +50,33 @@ heimq-broker│ (no edge either way) │
 
 We will **re-found object-log as a generic, buffered, multiplexing, durability-aware object-storage log engine that is generic over a pluggable `Sequencer`.** This supersedes ADR-001's per-append, Kafka-shaped model.
 
-**1. `BlobStore` port — the only storage abstraction.** Async `put`/`get`/`list`/`delete` over immutable objects keyed by string. Adapters: `Memory`, `Local`, `S3` (feature-gated). Replaces both the CAS `ObjectStore` and fjord's private `BlobStore`/`S3BlobStore`. No conditional writes needed — object keys are unique per flush.
+**1. `BlobStore` port — the only storage abstraction.** Async over immutable objects keyed by string. Adapters: `Memory`, `Local`, `S3` (feature-gated). Replaces both the CAS `ObjectStore` and fjord's private `BlobStore`/`S3BlobStore`. No conditional writes needed — object keys are unique per flush.
+
+```rust
+trait BlobStore: Send + Sync {
+    /// PUT `value` at `key`. MUST be durable-on-return: when this resolves Ok,
+    /// the bytes survive process/host crash (S3 inherently; the Local adapter
+    /// fsyncs the file AND its parent directory before returning). Callers may
+    /// treat a returned Ok as a durability barrier.
+    async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError>;
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError>;
+    /// Read a byte sub-range of an object (S3 Range GET; local pread). Lets a
+    /// consumer pull one batch/chunk out of a large multiplexed object without
+    /// fetching the whole thing. `None` if the key is absent; an out-of-bounds
+    /// range is an error.
+    async fn get_range(&self, key: &str, range: Range<u64>)
+        -> Result<Option<Bytes>, ObjectLogError>;
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError>;
+    async fn delete(&self, key: &str) -> Result<(), ObjectLogError>;
+}
+```
+
+The **durable-on-return** contract is what lets a consumer mark a write committed
+once `put` resolves (niflheim's control plane sets `cold_durable` after the PUT;
+fjord's `acks=all`→`Sequenced` depends on it). **`get_range`** serves consumers
+that address sub-object byte ranges (niflheim loads one chunk from a coalesced cold
+segment; the engine's own `fetch` uses it to read only the needed slice rather than
+the whole object). Both are generic — no Kafka or WAL concepts.
 
 **2. `LogEngine<S: Sequencer>` — buffered group-commit.** Accepts opaque batch payloads with a partition key, a record count, and `S`'s metadata; **group-commits**: many batches across many partitions are multiplexed into **one** object, PUT durably, then handed to the sequencer in one call. Owns the flush policy `FlushConfig { max_bytes, max_batches, linger }`. The engine **authors each batch's `BatchLocation { object_id, byte_start, byte_len }`** (its concern); it never inspects `S`'s metadata.
 
@@ -99,7 +125,7 @@ pub trait Sequencer: Send + Sync {
 
 **5. Sync seam, async engine.** The `Sequencer` is sync because a linearization point is a critical section, not async I/O — and fjord's sequencer does blocking Postgres I/O. The engine owns the flush worker (a dedicated thread / blocking task, per fjord's proven `Flusher`) and resolves async produce futures via waker. No `async_trait`/`spawn_blocking` tax on the lin-point.
 
-**6. Fetch.** `engine.fetch(partition, offset, max_bytes)` calls `sequencer.lookup` → reads the covering objects via `BlobStore` → slices `byte_start..byte_len`. Pure storage IO; the index is the sequencer's. The engine also exposes `engine.truncate_before(partition, offset)` (calls the sequencer, then deletes the returned dead object ids) and an optional **streaming read** (`fetch_stream`, visitor/`Stream`) so a consumer can replay a wide offset window without materializing it (niflheim's bounded-RAM replay; optional for fjord, whose fetch responses are already size-bounded).
+**6. Fetch.** `engine.fetch(partition, offset, max_bytes)` calls `sequencer.lookup` → reads the covering objects via `BlobStore::get_range(object_id, byte_start..byte_start+byte_len)` (only the needed slice, not the whole object) → returns the bytes. Pure storage IO; the index is the sequencer's. The engine also exposes `engine.truncate_before(partition, offset)` (calls the sequencer, then deletes the returned dead object ids) and an optional **streaming read** (`fetch_stream`, visitor/`Stream`) so a consumer can replay a wide offset window without materializing it (niflheim's bounded-RAM replay; optional for fjord, whose fetch responses are already size-bounded).
 
 **7. Offset stamping stays in heimq.** object-log stores and returns **opaque** payload bytes plus the assigned `base_offset`. Writing that offset into a Kafka v2 record batch is heimq's job (it owns the format). fjord must stop poking bytes `[0..8]`.
 
@@ -118,6 +144,8 @@ object-log is the **durable object-storage log tier**: durability == the object 
 A full in-object-log **n-tier** (hot + cold + migration) model was formally proposed and **rejected** under adversarial review (see `../ntier-proposal.md`): the hot-tier port could not be made generic without becoming niflheim's WAL renamed (intra-segment byte positions, an fsync-mode taxonomy, framing-aware seal/read), and the migrator reintroduced the very location-mutation crash windows this immutable-append-only design eliminates. niflheim therefore integrates at the **cold tier** (swapping its cold WAL backend to object-log) and keeps its own hot tier — real code-sharing where the use cases genuinely coincide, with the boundary drawn where they diverge.
 
 niflheim's WAL was evaluated as a second consumer to test genericity (object-log's own vision names it). Result: **its cold tier maps ~1:1 onto this design** — immutable, checksummed, offset-indexed segments coalesced onto an object store — which validates that the design is genuinely generic and not fjord-shaped. Three of our decisions are confirmed by the exercise: payloads are **opaque** (niflheim serializes its tenant/offset/event-id structure into the payload; object-log never learns those fields), epoch fencing lives **behind the Sequencer** (not in core), and record framing is **not** a core concern. The dual-consumer requirement is exactly what motivated the generic primitives above — `truncate_before` (Kafka retention *and* WAL retirement), index-only offset bounds, and the optional streaming read — none of which leak Kafka or WAL concepts. Two niflheim concerns are correctly **excluded**: its hot/fsync tier (above) and its record codec (a niflheim-side concern over opaque payloads).
+
+niflheim's **chunk tracking** (`chunk_seq`, offset bounds, `cold_durable`/`backing_store_flushed` state) and **durable-commit** (epoch-leased "publish only after durable") live in its control plane + segment index — *above* the storage port — so they are unaffected by swapping the cold backend to object-log; niflheim keeps them. They depend on object-log only via two `BlobStore` guarantees, both folded into the port above and both generic: **durable-on-return `put`** (so the control plane can mark `cold_durable` once the PUT resolves) and **`get_range`** (so a chunk can be loaded from a coalesced cold object by byte range). niflheim wraps object-log's `BlobStore` in a thin `ObjectStore` adapter for the cold path (`state` is always-cold; `sync_to_cold` = the PUT); object-log is the cold blob backend, niflheim owns everything above it.
 
 ## Alternatives
 
