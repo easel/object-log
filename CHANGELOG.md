@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-06-17
+
+**Breaking re-foundation (ADR-002).** object-log is now a buffered, multiplexing,
+durability-aware object-storage **log engine** with a pluggable sequencing seam,
+replacing the one-object-per-append `ObjectLogBackend`.
+
+### Added
+- `BlobStore` storage port — durable-on-return `put` (multipart on S3), `get`,
+  `get_range`, `list`, `delete` — with `MemoryBlobStore`, `LocalBlobStore`, and
+  `S3BlobStore` (behind the `s3` feature) adapters.
+- `LogEngine<S: Sequencer>` — group-commits many batches into one object, PUTs it
+  durably (durable-then-sequence), and resolves produce futures at
+  `Durability::{Buffered, Durable, Sequenced}`. `FlushConfig`, `fetch`,
+  `truncate_before`.
+- `Sequencer` seam (sync, generic over `Meta`) + `InMemorySequencer` and a
+  `BlobStore`-persisted `ManifestSequencer` (crash-durable standalone log).
+
+### Removed
+- The per-append `ObjectLogBackend`, the segment codec, `EpochGuard`, the record
+  model (`AppendRecord`/`RecordHeader`/`TimestampPolicy`/`AckMode`), and the
+  CAS `ObjectStore` port.
+
 ## [Unreleased]
 
 ### Added
