@@ -47,11 +47,13 @@
 mod blob;
 mod engine;
 mod error;
+mod manifest_sequencer;
 mod sequencer;
 
 pub use blob::{BlobStore, LocalBlobStore, MemoryBlobStore};
 pub use engine::{AppendOutcome, Durability, FetchedBatch, FlushConfig, LogEngine};
 pub use error::ObjectLogError;
+pub use manifest_sequencer::ManifestSequencer;
 pub use sequencer::{
     BatchLocation, CommitBatch, CommitOutcome, InMemorySequencer, IndexEntry, PartitionKey,
     Sequencer,
