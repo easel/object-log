@@ -3,6 +3,8 @@
 
 use crate::ObjectLogError;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 /// Opaque, engine-visible identifier for an independent offset stream (one dense,
 /// monotonic offset space). A Kafka broker maps `(topic, partition)` onto one of
@@ -120,4 +122,131 @@ pub trait Sequencer: Send + Sync {
         partition: &PartitionKey,
         offset: i64,
     ) -> Result<Vec<String>, ObjectLogError>;
+}
+
+/// Per-partition in-memory index state.
+#[derive(Default)]
+struct PartState {
+    next_offset: i64,
+    log_start: i64,
+    entries: Vec<IndexEntry>,
+}
+
+/// A single-node, in-memory [`Sequencer`] (`Meta = ()`): assigns dense offsets and
+/// keeps the offset→location index in memory.
+///
+/// The log *bytes* live durably in the `BlobStore`, but this index does not
+/// survive a restart — use it for tests and single-process work, or persist the
+/// index yourself for a crash-durable standalone log.
+#[derive(Default)]
+pub struct InMemorySequencer {
+    state: Mutex<HashMap<PartitionKey, PartState>>,
+}
+
+impl InMemorySequencer {
+    /// Create an empty sequencer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Sequencer for InMemorySequencer {
+    type Meta = ();
+
+    fn commit(
+        &self,
+        batches: &[CommitBatch<'_, Self::Meta>],
+    ) -> Result<Vec<CommitOutcome>, ObjectLogError> {
+        let mut state = self.state.lock().expect("poisoned");
+        let mut outcomes = Vec::with_capacity(batches.len());
+        for cb in batches {
+            let ps = state.entry(cb.partition.clone()).or_default();
+            let base = ps.next_offset;
+            ps.entries.push(IndexEntry {
+                location: cb.location.clone(),
+                base_offset: base,
+                record_count: cb.record_count,
+            });
+            ps.next_offset = base + cb.record_count as i64;
+            outcomes.push(CommitOutcome::Assigned {
+                base_offset: base,
+                record_count: cb.record_count,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    fn lookup(
+        &self,
+        partition: &PartitionKey,
+        fetch_offset: i64,
+    ) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        let state = self.state.lock().expect("poisoned");
+        let Some(ps) = state.get(partition) else {
+            return Ok(Vec::new());
+        };
+        Ok(ps
+            .entries
+            .iter()
+            .filter(|e| e.base_offset + e.record_count as i64 > fetch_offset)
+            .cloned()
+            .collect())
+    }
+
+    fn high_watermark(&self, partition: &PartitionKey) -> Result<i64, ObjectLogError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("poisoned")
+            .get(partition)
+            .map_or(0, |ps| ps.next_offset))
+    }
+
+    fn log_start_offset(&self, partition: &PartitionKey) -> Result<i64, ObjectLogError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("poisoned")
+            .get(partition)
+            .map_or(0, |ps| ps.log_start))
+    }
+
+    fn truncate_before(
+        &self,
+        partition: &PartitionKey,
+        offset: i64,
+    ) -> Result<Vec<String>, ObjectLogError> {
+        let mut state = self.state.lock().expect("poisoned");
+        let mut dropped: Vec<String> = Vec::new();
+        match state.get_mut(partition) {
+            Some(ps) => {
+                for e in ps.entries.iter() {
+                    if e.base_offset + e.record_count as i64 <= offset {
+                        dropped.push(e.location.object_id.clone());
+                    }
+                }
+                ps.entries
+                    .retain(|e| e.base_offset + e.record_count as i64 > offset);
+                if offset > ps.log_start {
+                    ps.log_start = offset.min(ps.next_offset);
+                }
+            }
+            None => return Ok(Vec::new()),
+        }
+        // An object is reclaimable only when no entry in ANY partition references it.
+        let mut live: HashSet<String> = HashSet::new();
+        for ps in state.values() {
+            for e in &ps.entries {
+                live.insert(e.location.object_id.clone());
+            }
+        }
+        let mut dead: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for oid in dropped {
+            if !live.contains(&oid) && seen.insert(oid.clone()) {
+                dead.push(oid);
+            }
+        }
+        Ok(dead)
+    }
 }
