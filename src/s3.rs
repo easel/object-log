@@ -8,11 +8,15 @@
 use crate::{BlobStore, ObjectLogError};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::config::{
+    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+    timeout::TimeoutConfig,
+};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use std::ops::Range;
+use std::time::Duration;
 
 fn unavailable<E: std::fmt::Display>(e: E) -> ObjectLogError {
     ObjectLogError::StorageUnavailable(e.to_string())
@@ -45,6 +49,15 @@ impl S3BlobStore {
             .region(Region::new(region.to_string()))
             .credentials_provider(creds)
             .force_path_style(true)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .read_timeout(Duration::from_secs(10))
+                    .operation_timeout(Duration::from_secs(30))
+                    .build(),
+            )
             .build();
         Self {
             client: Client::from_conf(conf),
@@ -197,6 +210,22 @@ impl BlobStore for S3BlobStore {
                 Some(_) => Ok(Some(Bytes::new())),
                 None => Ok(None),
             };
+        }
+        if std::env::var_os("OBJECT_LOG_S3_RANGE_FALLBACK").is_some() {
+            let Some(bytes) = self.get(key).await? else {
+                return Ok(None);
+            };
+            let start = range.start as usize;
+            let end = range.end as usize;
+            if start > bytes.len() || end > bytes.len() {
+                return Err(ObjectLogError::RangeOutOfBounds(format!(
+                    "{}..{} outside object length {}",
+                    range.start,
+                    range.end,
+                    bytes.len()
+                )));
+            }
+            return Ok(Some(bytes.slice(start..end)));
         }
         // HTTP byte ranges are inclusive: bytes=start-(end-1).
         let header = format!("bytes={}-{}", range.start, range.end - 1);
