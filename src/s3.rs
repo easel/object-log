@@ -14,7 +14,7 @@ use aws_sdk_s3::config::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -30,6 +30,8 @@ pub struct S3BlobStore {
     multipart_threshold: usize,
     /// Multipart part size.
     part_size: usize,
+    /// Use SigV4's UNSIGNED-PAYLOAD mode for PUT/UploadPart requests.
+    disable_payload_signing: bool,
 }
 
 impl S3BlobStore {
@@ -53,9 +55,18 @@ impl S3BlobStore {
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .timeout_config(
                 TimeoutConfig::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .read_timeout(Duration::from_secs(10))
-                    .operation_timeout(Duration::from_secs(30))
+                    .connect_timeout(Duration::from_secs(env_u64(
+                        "OBJECT_LOG_S3_CONNECT_TIMEOUT_SECS",
+                        5,
+                    )))
+                    .read_timeout(Duration::from_secs(env_u64(
+                        "OBJECT_LOG_S3_READ_TIMEOUT_SECS",
+                        10,
+                    )))
+                    .operation_timeout(Duration::from_secs(env_u64(
+                        "OBJECT_LOG_S3_OPERATION_TIMEOUT_SECS",
+                        30,
+                    )))
                     .build(),
             )
             .build();
@@ -64,6 +75,7 @@ impl S3BlobStore {
             bucket: bucket.to_string(),
             multipart_threshold: 16 * 1024 * 1024,
             part_size: 8 * 1024 * 1024,
+            disable_payload_signing: env_flag("OBJECT_LOG_S3_DISABLE_PAYLOAD_SIGNING"),
         }
     }
 
@@ -71,6 +83,16 @@ impl S3BlobStore {
     pub fn with_multipart(mut self, threshold: usize, part_size: usize) -> Self {
         self.multipart_threshold = threshold;
         self.part_size = part_size.max(5 * 1024 * 1024); // S3 minimum part size
+        self
+    }
+
+    /// Disable SigV4 payload hashing for PUT/UploadPart requests.
+    ///
+    /// This sends `x-amz-content-sha256: UNSIGNED-PAYLOAD`, which is useful for
+    /// trusted S3-compatible deployments where TLS/private-network integrity is
+    /// sufficient and per-byte SHA-256 signing is the throughput bottleneck.
+    pub fn with_payload_signing_disabled(mut self, disabled: bool) -> Self {
+        self.disable_payload_signing = disabled;
         self
     }
 
@@ -116,17 +138,20 @@ impl S3BlobStore {
         while offset < value.len() {
             let end = (offset + self.part_size).min(value.len());
             let chunk = value.slice(offset..end);
-            let uploaded = self
+            let request = self
                 .client
                 .upload_part()
                 .bucket(&self.bucket)
                 .key(key)
                 .upload_id(upload_id)
                 .part_number(part_number)
-                .body(ByteStream::from(chunk))
-                .send()
-                .await
-                .map_err(unavailable)?;
+                .body(ByteStream::from(chunk));
+            let uploaded = if self.disable_payload_signing {
+                request.customize().disable_payload_signing().send().await
+            } else {
+                request.send().await
+            }
+            .map_err(unavailable)?;
             parts.push(
                 CompletedPart::builder()
                     .set_e_tag(uploaded.e_tag().map(str::to_string))
@@ -150,6 +175,142 @@ impl S3BlobStore {
             .map_err(unavailable)?;
         Ok(())
     }
+
+    async fn upload_one_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        chunk: Bytes,
+    ) -> Result<CompletedPart, ObjectLogError> {
+        let request = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(chunk));
+        let uploaded = if self.disable_payload_signing {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        }
+        .map_err(unavailable)?;
+        Ok(CompletedPart::builder()
+            .set_e_tag(uploaded.e_tag().map(str::to_string))
+            .part_number(part_number)
+            .build())
+    }
+
+    async fn put_multipart_chunks(
+        &self,
+        key: &str,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), ObjectLogError> {
+        let created = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(unavailable)?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| ObjectLogError::StorageUnavailable("missing upload id".into()))?
+            .to_string();
+
+        match self.upload_chunk_parts(key, &upload_id, chunks).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn upload_chunk_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), ObjectLogError> {
+        let mut parts = Vec::new();
+        let mut part_number = 1i32;
+        let mut pending = BytesMut::with_capacity(self.part_size);
+
+        for chunk in chunks {
+            let mut offset = 0usize;
+            while offset < chunk.len() {
+                if pending.is_empty() && chunk.len() - offset >= self.part_size {
+                    let end = offset + self.part_size;
+                    parts.push(
+                        self.upload_one_part(key, upload_id, part_number, chunk.slice(offset..end))
+                            .await?,
+                    );
+                    part_number += 1;
+                    offset = end;
+                    continue;
+                }
+
+                let take = (self.part_size - pending.len()).min(chunk.len() - offset);
+                pending.extend_from_slice(&chunk.slice(offset..offset + take));
+                offset += take;
+
+                if pending.len() == self.part_size {
+                    parts.push(
+                        self.upload_one_part(key, upload_id, part_number, pending.freeze())
+                            .await?,
+                    );
+                    part_number += 1;
+                    pending = BytesMut::with_capacity(self.part_size);
+                }
+            }
+        }
+
+        if !pending.is_empty() {
+            parts.push(
+                self.upload_one_part(key, upload_id, part_number, pending.freeze())
+                    .await?,
+            );
+        }
+
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .map_err(unavailable)?;
+        Ok(())
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[async_trait]
@@ -158,15 +319,37 @@ impl BlobStore for S3BlobStore {
         if value.len() > self.multipart_threshold {
             return self.put_multipart(key, value).await;
         }
-        self.client
+        let request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(value))
-            .send()
-            .await
-            .map_err(unavailable)?;
+            .body(ByteStream::from(value));
+        if self.disable_payload_signing {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        }
+        .map_err(unavailable)?;
         Ok(())
+    }
+
+    async fn put_chunks(&self, key: &str, chunks: Vec<Bytes>) -> Result<(), ObjectLogError> {
+        let total: usize = chunks.iter().map(Bytes::len).sum();
+        if total > self.multipart_threshold {
+            return self.put_multipart_chunks(key, chunks).await;
+        }
+        match chunks.len() {
+            0 => self.put(key, Bytes::new()).await,
+            1 => self.put(key, chunks.into_iter().next().unwrap()).await,
+            _ => {
+                let mut value = BytesMut::with_capacity(total);
+                for chunk in chunks {
+                    value.extend_from_slice(&chunk);
+                }
+                self.put(key, value.freeze()).await
+            }
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {

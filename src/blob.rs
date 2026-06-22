@@ -2,7 +2,7 @@
 
 use crate::ObjectLogError;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -29,6 +29,26 @@ pub trait BlobStore: Send + Sync {
     /// `value` may be arbitrarily large; a network adapter should chunk it
     /// (e.g. S3 multipart) rather than rely on a single request.
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError>;
+
+    /// Durably store a logical object assembled from immutable byte chunks.
+    ///
+    /// The default implementation concatenates chunks and delegates to
+    /// [`put`](BlobStore::put). Object-store adapters can override this to stream
+    /// or multipart-upload chunks without materializing the full object twice.
+    async fn put_chunks(&self, key: &str, chunks: Vec<Bytes>) -> Result<(), ObjectLogError> {
+        match chunks.len() {
+            0 => self.put(key, Bytes::new()).await,
+            1 => self.put(key, chunks.into_iter().next().unwrap()).await,
+            _ => {
+                let total = chunks.iter().map(Bytes::len).sum();
+                let mut value = BytesMut::with_capacity(total);
+                for chunk in chunks {
+                    value.extend_from_slice(&chunk);
+                }
+                self.put(key, value.freeze()).await
+            }
+        }
+    }
 
     /// Fetch the whole object at `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError>;

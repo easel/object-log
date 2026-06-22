@@ -2,12 +2,16 @@
 
 use crate::sequencer::BatchLocation;
 use crate::{BlobStore, CommitBatch, CommitOutcome, ObjectLogError, PartitionKey, Sequencer};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle as TokioJoinHandle;
+
+const STORAGE_RETRY_ATTEMPTS: usize = 5;
+const STORAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
 
 /// The durability point a [`LogEngine::produce`] call resolves at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,14 +38,22 @@ pub struct FlushConfig {
     /// Maximum time a batch waits in the buffer before a flush is forced. `ZERO`
     /// flushes as soon as a batch arrives (lowest latency).
     pub linger: Duration,
+    /// Maximum number of sealed objects that may be PUT concurrently.
+    pub max_inflight_flushes: usize,
+    /// Maximum bytes owned by queued plus in-flight flush work. Producers block
+    /// once this budget is exhausted, which makes memory use an explicit tradeoff
+    /// against latency.
+    pub max_buffered_bytes: usize,
 }
 
 impl Default for FlushConfig {
     fn default() -> Self {
         Self {
-            max_bytes: 8 * 1024 * 1024,
+            max_bytes: 128 * 1024 * 1024,
             max_batches: 10_000,
             linger: Duration::ZERO,
+            max_inflight_flushes: 4,
+            max_buffered_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -70,7 +82,65 @@ pub struct FetchedBatch {
     pub payload: Bytes,
 }
 
+/// Snapshot of the engine's buffering envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferStats {
+    /// Bytes still waiting in the mutable accumulation queue.
+    pub queued_bytes: usize,
+    /// Bytes owned by queued plus sealed in-flight flush work.
+    pub bytes_in_use: usize,
+    /// Batches still waiting in the mutable accumulation queue.
+    pub queued_batches: usize,
+    /// Configured upper bound for `bytes_in_use`.
+    pub max_buffered_bytes: usize,
+}
+
 type Responder = oneshot::Sender<Result<AppendOutcome, ObjectLogError>>;
+
+fn retryable_storage_error(err: &ObjectLogError) -> bool {
+    matches!(err, ObjectLogError::StorageUnavailable(_))
+}
+
+async fn retry_delay(attempt: usize) {
+    let multiplier = 1u32 << attempt.min(5);
+    tokio::time::sleep(STORAGE_RETRY_BASE_DELAY * multiplier).await;
+}
+
+async fn put_chunks_with_retries(
+    blob: &Arc<dyn BlobStore>,
+    key: &str,
+    chunks: Vec<Bytes>,
+) -> Result<(), ObjectLogError> {
+    let mut attempt = 0usize;
+    loop {
+        match blob.put_chunks(key, chunks.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) if retryable_storage_error(&err) && attempt < STORAGE_RETRY_ATTEMPTS => {
+                retry_delay(attempt).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn get_range_with_retries(
+    blob: &Arc<dyn BlobStore>,
+    key: &str,
+    range: std::ops::Range<u64>,
+) -> Result<Option<Bytes>, ObjectLogError> {
+    let mut attempt = 0usize;
+    loop {
+        match blob.get_range(key, range.clone()).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) if retryable_storage_error(&err) && attempt < STORAGE_RETRY_ATTEMPTS => {
+                retry_delay(attempt).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 struct Pending<M> {
     partition: PartitionKey,
@@ -81,15 +151,33 @@ struct Pending<M> {
     responder: Option<Responder>,
 }
 
+struct FlushWork<M> {
+    batch: Vec<Pending<M>>,
+    locations: Vec<BatchLocation>,
+    responders: Vec<(Durability, Option<Responder>)>,
+    bytes: usize,
+    put: Option<TokioJoinHandle<Result<(), ObjectLogError>>>,
+    put_started: Instant,
+    put_result: Option<Result<Duration, ObjectLogError>>,
+}
+
+enum TakeBatch<M> {
+    Batch(Vec<Pending<M>>),
+    Empty,
+    Shutdown,
+}
+
 struct Queue<M> {
     items: VecDeque<Pending<M>>,
     bytes: usize,
+    bytes_in_use: usize,
     shutdown: bool,
 }
 
 struct Shared<M> {
     queue: Mutex<Queue<M>>,
     cv: Condvar,
+    max_buffered_bytes: usize,
 }
 
 /// A buffered, multiplexing append-log engine over a [`BlobStore`], with
@@ -121,13 +209,18 @@ where
         config: FlushConfig,
         key_prefix: impl Into<String>,
     ) -> Self {
+        if std::env::var("OLOG_DEBUG_FLUSH_CONFIG").is_ok() {
+            eprintln!("object-log flush config: {config:?}");
+        }
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
                 bytes: 0,
+                bytes_in_use: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            max_buffered_bytes: config.max_buffered_bytes.max(config.max_bytes),
         });
         let flush_thread = {
             let shared = Arc::clone(&shared);
@@ -191,10 +284,26 @@ where
     }
 
     fn enqueue(&self, item: Pending<S::Meta>) {
-        let mut q = self.shared.queue.lock().expect("poisoned");
-        q.bytes += item.payload.len();
-        q.items.push_back(item);
-        self.shared.cv.notify_one();
+        let item_len = item.payload.len();
+        let max_buffered_bytes = self.shared.max_buffered_bytes;
+        let shared = Arc::clone(&self.shared);
+        let enqueue = move || {
+            let mut q = shared.queue.lock().expect("poisoned");
+            while !q.shutdown
+                && q.bytes_in_use > 0
+                && q.bytes_in_use.saturating_add(item_len) > max_buffered_bytes
+            {
+                q = shared.cv.wait(q).expect("poisoned");
+            }
+            if q.shutdown {
+                return;
+            }
+            q.bytes += item_len;
+            q.bytes_in_use += item_len;
+            q.items.push_back(item);
+            shared.cv.notify_all();
+        };
+        enqueue();
     }
 
     /// Read batches covering offsets at/after `offset`, up to ~`max_bytes`.
@@ -213,9 +322,7 @@ where
             }
             let start = e.location.byte_start as u64;
             let end = start + e.location.byte_len as u64;
-            let bytes = self
-                .blob
-                .get_range(&e.location.object_id, start..end)
+            let bytes = get_range_with_retries(&self.blob, &e.location.object_id, start..end)
                 .await?
                 .ok_or_else(|| ObjectLogError::MissingObject(e.location.object_id.clone()))?;
             total += bytes.len();
@@ -240,6 +347,17 @@ where
             self.blob.delete(&object_id).await?;
         }
         Ok(())
+    }
+
+    /// Return a point-in-time snapshot of queued and in-flight payload bytes.
+    pub fn buffer_stats(&self) -> BufferStats {
+        let q = self.shared.queue.lock().expect("poisoned");
+        BufferStats {
+            queued_bytes: q.bytes,
+            bytes_in_use: q.bytes_in_use,
+            queued_batches: q.items.len(),
+            max_buffered_bytes: self.shared.max_buffered_bytes,
+        }
     }
 }
 
@@ -266,128 +384,283 @@ fn flush_loop<S>(
     S: Sequencer + 'static,
     S::Meta: Send + 'static,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let max_inflight = config.max_inflight_flushes.max(1);
+    let worker_threads = std::env::var("OBJECT_LOG_FLUSH_RUNTIME_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| max_inflight.min(8));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .expect("flush runtime");
     let mut counter: u64 = 0;
+    let mut pending: VecDeque<FlushWork<S::Meta>> = VecDeque::new();
+    let mut active_puts = 0usize;
+    let mut shutdown = false;
 
     loop {
-        let mut batch: Vec<Pending<S::Meta>> = {
-            let mut q = shared.queue.lock().expect("poisoned");
-            loop {
-                if q.items.is_empty() {
-                    if q.shutdown {
-                        return;
-                    }
-                    q = shared.cv.wait(q).expect("poisoned");
-                    continue;
+        while !shutdown && active_puts < max_inflight {
+            let wait_for_more = pending.is_empty();
+            match take_batch(&shared, config, wait_for_more) {
+                TakeBatch::Batch(batch) => {
+                    counter += 1;
+                    pending.push_back(start_flush_work(&rt, &blob, &prefix, counter, batch));
+                    active_puts += 1;
                 }
-                let triggered = q.shutdown
-                    || q.bytes >= config.max_bytes
-                    || q.items.len() >= config.max_batches
-                    || config.linger.is_zero();
-                if triggered {
-                    break;
-                }
-                let (guard, timeout) = shared.cv.wait_timeout(q, config.linger).expect("poisoned");
-                q = guard;
-                if timeout.timed_out() {
-                    break;
-                }
+                TakeBatch::Empty => break,
+                TakeBatch::Shutdown => shutdown = true,
             }
-            let items: Vec<_> = q.items.drain(..).collect();
-            q.bytes = 0;
-            items
-        };
-
-        // Build one object from all buffered payloads; record each batch's range.
-        let mut object = BytesMut::new();
-        let mut locations: Vec<BatchLocation> = Vec::with_capacity(batch.len());
-        counter += 1;
-        let key = format!("{prefix}{counter:020}");
-        for p in &batch {
-            let start = object.len() as u32;
-            object.extend_from_slice(&p.payload);
-            locations.push(BatchLocation {
-                object_id: key.clone(),
-                byte_start: start,
-                byte_len: p.payload.len() as u32,
-            });
         }
 
-        // Move responders out (so the commit borrow of `batch` doesn't conflict).
-        let mut responders: Vec<(Durability, Option<Responder>)> = batch
-            .iter_mut()
-            .map(|p| (p.durability, p.responder.take()))
-            .collect();
+        let mut made_progress = false;
+        for work in pending.iter_mut() {
+            let Some(put) = work.put.as_ref() else {
+                continue;
+            };
+            if !put.is_finished() {
+                continue;
+            }
+            let put = work.put.take().expect("put handle exists");
+            let elapsed = work.put_started.elapsed();
+            work.put_result = Some(match rt.block_on(put) {
+                Ok(Ok(())) => Ok(elapsed),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(ObjectLogError::StorageUnavailable(format!(
+                    "flush task failed: {e}"
+                ))),
+            });
+            active_puts = active_puts.saturating_sub(1);
+            made_progress = true;
+        }
 
-        // Durable-then-sequence: PUT first.
-        if let Err(e) = rt.block_on(blob.put(&key, object.freeze())) {
-            for (_, tx) in responders.iter_mut() {
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(Err(e.clone()));
+        while pending
+            .front()
+            .is_some_and(|work| work.put_result.is_some())
+        {
+            let work = pending.pop_front().expect("front exists");
+            let released = finish_flush_work(&sequencer, work);
+            let mut q = shared.queue.lock().expect("poisoned");
+            q.bytes_in_use = q.bytes_in_use.saturating_sub(released);
+            shared.cv.notify_all();
+            made_progress = true;
+        }
+
+        if pending.is_empty() {
+            if shutdown {
+                return;
+            }
+            continue;
+        }
+
+        if !made_progress {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+fn take_batch<M>(
+    shared: &Arc<Shared<M>>,
+    config: FlushConfig,
+    wait_when_empty: bool,
+) -> TakeBatch<M> {
+    let mut q = shared.queue.lock().expect("poisoned");
+    loop {
+        if q.items.is_empty() {
+            if q.shutdown {
+                return TakeBatch::Shutdown;
+            }
+            if !wait_when_empty {
+                return TakeBatch::Empty;
+            }
+            if config.linger.is_zero() {
+                q = shared.cv.wait(q).expect("poisoned");
+            } else {
+                let (guard, timeout) = shared.cv.wait_timeout(q, config.linger).expect("poisoned");
+                q = guard;
+                if timeout.timed_out() && q.items.is_empty() {
+                    return TakeBatch::Empty;
                 }
             }
             continue;
         }
 
-        // Signal Durable-level waiters now (after PUT, before commit).
-        for (durability, tx) in responders.iter_mut() {
-            if *durability == Durability::Durable
-                && let Some(tx) = tx.take()
-            {
-                let _ = tx.send(Ok(AppendOutcome {
-                    base_offset: None,
-                    last_offset: None,
-                    durable: true,
-                    sequenced: false,
-                }));
-            }
+        let triggered = q.shutdown
+            || q.bytes >= config.max_bytes
+            || q.items.len() >= config.max_batches
+            || config.linger.is_zero();
+        if triggered {
+            break;
         }
 
-        // Sequence the whole object atomically.
-        let commit_batches: Vec<CommitBatch<'_, S::Meta>> = batch
-            .iter()
-            .zip(locations.iter())
-            .map(|(p, loc)| CommitBatch {
-                partition: p.partition.clone(),
-                record_count: p.record_count,
-                location: loc.clone(),
-                meta: &p.meta,
-            })
-            .collect();
-
-        match sequencer.commit(&commit_batches) {
-            Ok(outcomes) => {
-                for (outcome, (_, tx)) in outcomes.into_iter().zip(responders.iter_mut()) {
-                    if let Some(tx) = tx.take() {
-                        let (base, last) = match outcome {
-                            CommitOutcome::Assigned {
-                                base_offset,
-                                record_count,
-                            } => (
-                                Some(base_offset),
-                                Some(base_offset + record_count as i64 - 1),
-                            ),
-                            CommitOutcome::Duplicate { base_offset } => (Some(base_offset), None),
-                        };
-                        let _ = tx.send(Ok(AppendOutcome {
-                            base_offset: base,
-                            last_offset: last,
-                            durable: true,
-                            sequenced: true,
-                        }));
-                    }
-                }
-            }
-            Err(e) => {
-                for (_, tx) in responders.iter_mut() {
-                    if let Some(tx) = tx.take() {
-                        let _ = tx.send(Err(e.clone()));
-                    }
-                }
-            }
+        let (guard, timeout) = shared.cv.wait_timeout(q, config.linger).expect("poisoned");
+        q = guard;
+        if timeout.timed_out() {
+            break;
         }
     }
+
+    let mut items = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(item) = q.items.pop_front() {
+        q.bytes = q.bytes.saturating_sub(item.payload.len());
+        bytes += item.payload.len();
+        items.push(item);
+        if bytes >= config.max_bytes || items.len() >= config.max_batches {
+            break;
+        }
+    }
+    if items.is_empty() {
+        TakeBatch::Empty
+    } else {
+        TakeBatch::Batch(items)
+    }
+}
+
+fn send_storage_error(responders: &mut [(Durability, Option<Responder>)], err: ObjectLogError) {
+    for (_, tx) in responders.iter_mut() {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(Err(err.clone()));
+        }
+    }
+}
+
+fn send_durable_acks(responders: &mut [(Durability, Option<Responder>)]) {
+    for (durability, tx) in responders.iter_mut() {
+        if *durability == Durability::Durable
+            && let Some(tx) = tx.take()
+        {
+            let _ = tx.send(Ok(AppendOutcome {
+                base_offset: None,
+                last_offset: None,
+                durable: true,
+                sequenced: false,
+            }));
+        }
+    }
+}
+
+fn start_flush_work<M>(
+    rt: &tokio::runtime::Runtime,
+    blob: &Arc<dyn BlobStore>,
+    prefix: &str,
+    counter: u64,
+    mut batch: Vec<Pending<M>>,
+) -> FlushWork<M> {
+    // Record each batch's range in the logical object. Payload chunks are handed
+    // to the BlobStore without first materializing one full contiguous buffer.
+    let mut locations: Vec<BatchLocation> = Vec::with_capacity(batch.len());
+    let mut chunks: Vec<Bytes> = Vec::with_capacity(batch.len());
+    let key = format!("{prefix}{counter:020}");
+    let mut offset = 0usize;
+    for p in &batch {
+        let start = offset as u32;
+        offset += p.payload.len();
+        chunks.push(p.payload.clone());
+        locations.push(BatchLocation {
+            object_id: key.clone(),
+            byte_start: start,
+            byte_len: p.payload.len() as u32,
+        });
+    }
+    if std::env::var("OLOG_DEBUG_FLUSH_CONFIG").is_ok() {
+        eprintln!(
+            "object-log seal: key={key} batches={} bytes={offset}",
+            batch.len()
+        );
+    }
+
+    // Move responders out (so the commit borrow of `batch` doesn't conflict).
+    let responders: Vec<(Durability, Option<Responder>)> = batch
+        .iter_mut()
+        .map(|p| (p.durability, p.responder.take()))
+        .collect();
+
+    let blob = Arc::clone(blob);
+    let put_started = Instant::now();
+    let put = rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await });
+
+    FlushWork {
+        batch,
+        locations,
+        responders,
+        bytes: offset,
+        put: Some(put),
+        put_started,
+        put_result: None,
+    }
+}
+
+fn finish_flush_work<S>(sequencer: &Arc<S>, mut work: FlushWork<S::Meta>) -> usize
+where
+    S: Sequencer + 'static,
+    S::Meta: Send + 'static,
+{
+    let release_bytes = work.bytes;
+    // Durable-then-sequence: the object PUT may have overlapped later PUTs, but
+    // sequencer commits are still completed in object creation order.
+    let timing = std::env::var("OLOG_DEBUG_FLUSH_TIMING").is_ok();
+    let put_elapsed = match work.put_result.take().expect("put result is ready") {
+        Ok(elapsed) => elapsed,
+        Err(e) => {
+            send_storage_error(&mut work.responders, e);
+            return release_bytes;
+        }
+    };
+
+    // Signal Durable-level waiters now (after PUT, before commit).
+    send_durable_acks(&mut work.responders);
+
+    // Sequence the whole object atomically.
+    let commit_batches: Vec<CommitBatch<'_, S::Meta>> = work
+        .batch
+        .iter()
+        .zip(work.locations.iter())
+        .map(|(p, loc)| CommitBatch {
+            partition: p.partition.clone(),
+            record_count: p.record_count,
+            location: loc.clone(),
+            meta: &p.meta,
+        })
+        .collect();
+
+    let commit_started = timing.then(Instant::now);
+    match sequencer.commit(&commit_batches) {
+        Ok(outcomes) => {
+            if let Some(commit_started) = commit_started {
+                eprintln!(
+                    "object-log flush timing: bytes={} batches={} put_ms={} commit_ms={}",
+                    work.bytes,
+                    commit_batches.len(),
+                    put_elapsed.as_millis(),
+                    commit_started.elapsed().as_millis()
+                );
+            }
+            for (outcome, (_, tx)) in outcomes.into_iter().zip(work.responders.iter_mut()) {
+                if let Some(tx) = tx.take() {
+                    let (base, last) = match outcome {
+                        CommitOutcome::Assigned {
+                            base_offset,
+                            record_count,
+                        } => (
+                            Some(base_offset),
+                            Some(base_offset + record_count as i64 - 1),
+                        ),
+                        CommitOutcome::Duplicate { base_offset } => (Some(base_offset), None),
+                    };
+                    let _ = tx.send(Ok(AppendOutcome {
+                        base_offset: base,
+                        last_offset: last,
+                        durable: true,
+                        sequenced: true,
+                    }));
+                }
+            }
+        }
+        Err(e) => {
+            send_storage_error(&mut work.responders, e);
+        }
+    }
+    release_bytes
 }

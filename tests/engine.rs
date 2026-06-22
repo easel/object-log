@@ -23,6 +23,8 @@ fn coalesce_after(n: usize) -> FlushConfig {
         max_bytes: usize::MAX,
         max_batches: n,
         linger: Duration::from_secs(3600),
+        max_inflight_flushes: 1,
+        max_buffered_bytes: usize::MAX,
     }
 }
 
@@ -217,6 +219,134 @@ async fn put_failure_yields_no_ack_no_offset() {
     assert!(matches!(err, ObjectLogError::StorageUnavailable(_)));
     // Nothing sequenced.
     assert_eq!(seq.high_watermark(&p).unwrap(), 0);
+}
+
+struct FailsPutOnce {
+    inner: MemoryBlobStore,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl BlobStore for FailsPutOnce {
+    async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+        if self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ObjectLogError::StorageUnavailable("transient put".into()));
+        }
+        self.inner.put(key, value).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ObjectLogError> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn transient_put_failure_is_retried_before_ack() {
+    let blob = Arc::new(FailsPutOnce {
+        inner: MemoryBlobStore::new(),
+        failures: AtomicUsize::new(0),
+    });
+    let engine = LogEngine::new(
+        Arc::clone(&blob) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let p = pk("t-0");
+    let out = engine
+        .produce(
+            p.clone(),
+            Bytes::from_static(b"v"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.base_offset, Some(0));
+    assert_eq!(blob.failures.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.fetch(&p, 0, 1024).await.unwrap().len(), 1);
+}
+
+struct FailsRangeOnce {
+    inner: MemoryBlobStore,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl BlobStore for FailsRangeOnce {
+    async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+        self.inner.put(key, value).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        if self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ObjectLogError::StorageUnavailable(
+                "transient get_range".into(),
+            ));
+        }
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ObjectLogError> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn transient_range_failure_is_retried_on_fetch() {
+    let blob = Arc::new(FailsRangeOnce {
+        inner: MemoryBlobStore::new(),
+        failures: AtomicUsize::new(0),
+    });
+    let engine = LogEngine::new(
+        Arc::clone(&blob) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let p = pk("t-0");
+    engine
+        .produce(
+            p.clone(),
+            Bytes::from_static(b"v"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    let out = engine.fetch(&p, 0, 1024).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(blob.failures.load(Ordering::SeqCst), 2);
 }
 
 // ---- A sequencer that fails its first commit, then works (fault BETWEEN put and commit). ----
